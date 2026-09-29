@@ -1542,6 +1542,14 @@ impl Database {
         Ok(())
     }
 
+    // Whether no transaction has ever committed: the file holds the header its initialization
+    // wrote, and nothing more
+    fn never_committed(mem: &TransactionalMemory) -> Result<bool> {
+        Ok(mem.get_last_committed_transaction_id()?.raw_id() == 0
+            && mem.get_data_root().is_none()
+            && mem.get_system_root().is_none())
+    }
+
     fn new(
         file: Box<dyn StorageBackend>,
         allow_initialize: bool,
@@ -1568,14 +1576,26 @@ impl Database {
         )?;
         let mut mem = Arc::new(mem);
         // If the last transaction used 2-phase commit and updated the allocator state table, then
-        // we can just load the allocator state from there. Otherwise, we need a full repair
-        let repaired = if let Some(tree) = Self::get_allocator_state_table(&mem)? {
+        // we can just load the allocator state from there. Otherwise it is rebuilt: from nothing
+        // when no transaction has committed, and by a full repair otherwise
+        let rebuilt = if let Some(tree) = Self::get_allocator_state_table(&mem)? {
             #[cfg(feature = "logging")]
             debug!("Found valid allocator state, full repair not needed");
             mem.load_allocator_state(&tree)?;
             #[cfg(debug_assertions)]
             Self::mark_allocated_page_for_debug(&mem)?;
             false
+        } else if Self::never_committed(&mem)? {
+            // Just initialized, or created and never written: with no commit there is nothing to
+            // recover, and a repair would only report a new file as not shut down cleanly, and
+            // fail every create for a repair callback that aborts
+            #[cfg(feature = "logging")]
+            debug!(
+                "Database {:?} has no committed transaction, nothing to repair",
+                &file_path
+            );
+            mem.load_empty_allocator_state()?;
+            true
         } else {
             #[cfg(feature = "logging")]
             warn!("Database {:?} not shutdown cleanly. Repairing", &file_path);
@@ -1606,9 +1626,10 @@ impl Database {
 
         // Restore the tracker state for any persistent savepoints
         Self::sync_persistent_savepoints(&transaction_tracker, &mem, writer_lock.as_ref())?;
-        // In multi-writer mode a repair ends with a commit recording the allocator state, as
-        // compaction and the integrity check do, so that the next open, in any process, loads it
-        if repaired && concurrency_mode == ConcurrencyMode::MultiWriter {
+        // In multi-writer mode a rebuilt allocator state, the create's included, is recorded by a
+        // commit, as compaction and the integrity check do, so that the next open, in any
+        // process, loads it
+        if rebuilt && concurrency_mode == ConcurrencyMode::MultiWriter {
             ensure_allocator_state_table_and_trim(
                 &transaction_tracker,
                 &mem,
@@ -2275,7 +2296,8 @@ mod test {
         let tmpfile = crate::create_tempfile();
         let (file, path) = tmpfile.into_parts();
 
-        let backend = FailingBackend::new(FileBackend::new(file).unwrap(), 20);
+        // Fails the fourth write of the second commit below; the create makes three
+        let backend = FailingBackend::new(FileBackend::new(file).unwrap(), 17);
         let db = Database::builder()
             .set_cache_size(12686)
             .set_page_size(8 * 1024)
